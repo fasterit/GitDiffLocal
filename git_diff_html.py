@@ -27,6 +27,8 @@ Usage:
         gdhtm abc123 file.c   working tree vs abc123, only file.c
         gdhtm -r aaa bbb      commit aaa vs commit bbb (explicit two-commit compare)
         gdhtm -s              staged changes (git diff --cached)
+        gdhtm old.c new.c     outside a git repo: plain old-vs-new file compare
+                              (exactly two file arguments; works outside a git repo, too)
 
 Options:
     -o, --output FILE   Output HTML file (default: a temp file in the system temp dir, e.g. /tmp)
@@ -481,13 +483,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <div class="layout">
-  <div class="sidebar" id="sidebar">
+  <div class="sidebar" id="sidebar" {sidebar_extra}>
     <h2>Changed Files ({file_count})</h2>
     <ul id="fileList">
 {sidebar_items}
     </ul>
   </div>
-  <div class="sb-resizer" id="sbResizer" title="Drag to resize sidebar"></div>
+  <div class="sb-resizer" id="sbResizer" {sidebar_extra} title="Drag to resize sidebar"></div>
 
   <div class="main" id="mainContent">
     <div class="summary">
@@ -524,7 +526,7 @@ window.addEventListener('scroll', () => {{
   sidebarLinks.forEach(l => {{ l.classList.remove('active'); if (l.getAttribute('href') === '#'+cur) l.classList.add('active'); }});
   backTop.style.display = window.scrollY > 300 ? 'block' : 'none';
 }});
-function toggleSidebar() {{ const sb=document.getElementById('sidebar'); sb.style.display=sb.style.display==='none'?'':'none'; }}
+function toggleSidebar() {{ ['sidebar','sbResizer'].forEach(id => {{ const el=document.getElementById(id); el.style.display=el.style.display==='none'?'':'none'; }}); }}
 
 // ===== Sidebar resize =====
 const sbResizer = document.getElementById('sbResizer');
@@ -709,6 +711,147 @@ setViewMode('diff');
 
 
 # ---------------------------------------------------------------------------
+# Report assembly (shared by the git path and the plain two-file path)
+# ---------------------------------------------------------------------------
+
+def build_html(entries, repo_name, commit_label, old_label, new_label,
+               syntax=True, context=3, sidebar_collapsed=False):
+    """Render the full report.
+
+    entries: list of (status, display_path, old_content, new_content)
+    sidebar_collapsed: start with the file-list column hidden (the topbar
+    "Toggle Files" button expands it again).
+    Returns (html_output, total_add, total_del).
+    """
+    file_sections, sidebar_items, summary_rows = [], [], []
+    total_add = total_del = 0
+
+    for idx, (status, display_path, old_content, new_content) in enumerate(entries):
+        anchor = f"file-{idx}"
+        status_label = {"M": "Modified", "A": "Added", "D": "Deleted", "R": "Renamed"}.get(status, status)
+
+        old_lines = old_content.splitlines() if old_content else []
+        new_lines = new_content.splitlines() if new_content else []
+
+        sm = SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+        add_c = del_c = 0
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "insert": add_c += j2 - j1
+            elif tag == "delete": del_c += i2 - i1
+            elif tag == "replace": del_c += i2 - i1; add_c += j2 - j1
+        total_add += add_c; total_del += del_c
+
+        try:
+            viewer = make_diff_viewer(
+                old_lines, new_lines, display_path,
+                syntax=syntax, context=context, idx=idx,
+                old_label=old_label, new_label=new_label,
+            )
+        except Exception as e:
+            viewer = f"<p style='color:#cf222e;padding:16px'>Error: {html.escape(str(e))}</p>"
+
+        file_sections.append(f"""    <div class="file-section" id="{anchor}">
+      <div class="file-header">
+        <span class="badge badge-{status}">{status_label}</span>
+        <span class="path">{html.escape(display_path)}</span>
+        <span class="stats"><span class="add">+{add_c}</span> / <span class="del">-{del_c}</span></span>
+      </div>
+      {viewer}
+    </div>
+""")
+        sidebar_items.append(
+            f'      <li><a href="#{anchor}"><span class="badge badge-{status}">{status}</span>{html.escape(display_path)}</a></li>'
+        )
+        summary_rows.append(
+            f'          <tr><td><a href="#{anchor}" style="color:var(--link);text-decoration:none">{html.escape(display_path)}</a></td>'
+            f'<td><span class="badge badge-{status}">{status_label}</span></td>'
+            f'<td class="num" style="color:#1a7f37">+{add_c}</td>'
+            f'<td class="num" style="color:#cf222e">-{del_c}</td></tr>'
+        )
+
+    summary_rows.append(
+        f'          <tr style="font-weight:600;background:var(--header-bg)">'
+        f'<td>Total ({len(entries)} files)</td><td></td>'
+        f'<td class="num" style="color:#1a7f37">+{total_add}</td>'
+        f'<td class="num" style="color:#cf222e">-{total_del}</td></tr>'
+    )
+
+    html_output = HTML_TEMPLATE.format(
+        title=repo_name, repo=repo_name, commit_label=commit_label,
+        gen_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        file_count=len(entries),
+        sidebar_extra='style="display:none"' if sidebar_collapsed else "",
+        sidebar_items="\n".join(sidebar_items),
+        summary_rows="\n".join(summary_rows),
+        file_sections="\n".join(file_sections),
+    )
+    return html_output, total_add, total_del
+
+
+def write_report(html_output, output=None):
+    """Write the report to `output` (or a secure temp file) and return its path."""
+    if output:
+        out_path = os.path.abspath(output)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html_output)
+    else:
+        # Produce the report in the system temp dir (TMPDIR or /tmp) under a
+        # secure, randomly-generated name via mkstemp, then keep the file open
+        # for writing through the same descriptor (avoids chmod/rename races).
+        fd, out_path = tempfile.mkstemp(prefix="git_diff_", suffix=".html")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(html_output)
+    return out_path
+
+
+def _finish(html_output, out_files, total_add, total_del, args):
+    out_path = write_report(html_output, args.output)
+    print(f"\nDiff report generated: {out_path}")
+    print(f"  Files: {out_files}  (+{total_add} / -{total_del} lines)")
+
+    if not args.no_open:
+        import webbrowser
+        webbrowser.open(f"file://{out_path}")
+        print(f"  Opened in default browser: file://{out_path}")
+    else:
+        print(f"  Open in browser: file://{out_path}")
+
+
+def _plain_file_diff(args, cwd):
+    """No git work tree available: compare exactly two files side by side."""
+    if args.range or args.staged or args.commit:
+        print("Error: -r/--range, -s/--staged and -c/--commit need a git repository.",
+              file=sys.stderr)
+        sys.exit(1)
+    paths = list(args.files)
+    if len(paths) != 2:
+        print("Error: not a git repository.", file=sys.stderr)
+        print(f"  Usage: {os.path.basename(sys.argv[0])} FILE_OLD FILE_NEW   "
+              "(plain compare outside a repo)", file=sys.stderr)
+        sys.exit(1)
+
+    contents = []
+    for p in paths:
+        full = p if os.path.isabs(p) else os.path.join(cwd, p)
+        if not os.path.isfile(full):
+            print(f"Error: '{p}' is not a readable file.", file=sys.stderr)
+            sys.exit(1)
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            contents.append(f.read())
+    old_path, new_path = paths
+
+    repo_name = os.path.basename(os.path.abspath(cwd)) or os.path.abspath(cwd)
+    display = f"{old_path} → {new_path}"
+    entries = [("M", display, contents[0], contents[1])]
+    html_output, total_add, total_del = build_html(
+        entries, repo_name, commit_label="file compare",
+        old_label=f"{old_path} (old)", new_label=f"{new_path} (new)",
+        syntax=not args.no_syntax, context=args.context, sidebar_collapsed=True,
+    )
+    _finish(html_output, 1, total_add, total_del, args)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -720,7 +863,8 @@ def main():
     )
     parser.add_argument("-o", "--output", default=None,
                         help="Output HTML file (default: securely-named temp file in the system temp dir)")
-    parser.add_argument("-c", "--commit", default="HEAD")
+    parser.add_argument("-c", "--commit", default=None,
+                        help="compare against a specific commit/ref (default: HEAD)")
     parser.add_argument("-r", "--range", nargs=2, metavar=("REF1", "REF2"),
                         help="compare two commits directly: gdhtm -r REF1 REF2")
     parser.add_argument("-s", "--staged", action="store_true")
@@ -738,8 +882,10 @@ def main():
     cwd = os.getcwd()
     stdout, rc = run_git(["rev-parse", "--show-toplevel"], cwd)
     if rc != 0:
-        print("Error: not a git repository", file=sys.stderr)
-        sys.exit(1)
+        # Outside any git work tree the only thing we can produce is a plain
+        # side-by-side compare of two files given as arguments.
+        _plain_file_diff(args, cwd)
+        return
     repo_root = stdout.strip()
     os.chdir(repo_root)
 
@@ -767,7 +913,7 @@ def main():
                     continue
             file_filter.append(a)
 
-        base_ref = base_ref or args.commit
+        base_ref = base_ref or args.commit or "HEAD"
         target_ref = None
         if staged:
             old_label, new_label = "HEAD (old)", "STAGED (new)"
@@ -804,96 +950,21 @@ def main():
 
     repo_name = os.path.basename(repo_root)
 
-    file_sections, sidebar_items, summary_rows = [], [], []
-    total_add = total_del = 0
-
-    for idx, (status, old_path, new_path) in enumerate(files):
+    entries = []
+    for status, old_path, new_path in files:
         display_path = new_path if status != "D" else old_path
-        anchor = f"file-{idx}"
-        status_label = {"M": "Modified", "A": "Added", "D": "Deleted", "R": "Renamed"}.get(status, status)
-
         old_content, new_content = get_file_content(
             repo_root, base_ref, old_path if status != "A" else new_path, staged, target_ref
         )
         if status == "R":
             _, new_content = get_file_content(repo_root, base_ref, new_path, staged, target_ref)
+        entries.append((status, display_path, old_content, new_content))
 
-        old_lines = old_content.splitlines() if old_content else []
-        new_lines = new_content.splitlines() if new_content else []
-
-        sm = SequenceMatcher(None, old_lines, new_lines, autojunk=False)
-        add_c = del_c = 0
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "insert": add_c += j2 - j1
-            elif tag == "delete": del_c += i2 - i1
-            elif tag == "replace": del_c += i2 - i1; add_c += j2 - j1
-        total_add += add_c; total_del += del_c
-
-        try:
-            viewer = make_diff_viewer(
-                old_lines, new_lines, display_path,
-                syntax=not args.no_syntax, context=args.context, idx=idx,
-                old_label=old_label, new_label=new_label,
-            )
-        except Exception as e:
-            viewer = f"<p style='color:#cf222e;padding:16px'>Error: {html.escape(str(e))}</p>"
-
-        file_sections.append(f"""    <div class="file-section" id="{anchor}">
-      <div class="file-header">
-        <span class="badge badge-{status}">{status_label}</span>
-        <span class="path">{html.escape(display_path)}</span>
-        <span class="stats"><span class="add">+{add_c}</span> / <span class="del">-{del_c}</span></span>
-      </div>
-      {viewer}
-    </div>
-""")
-        sidebar_items.append(
-            f'      <li><a href="#{anchor}"><span class="badge badge-{status}">{status}</span>{html.escape(display_path)}</a></li>'
-        )
-        summary_rows.append(
-            f'          <tr><td><a href="#{anchor}" style="color:var(--link);text-decoration:none">{html.escape(display_path)}</a></td>'
-            f'<td><span class="badge badge-{status}">{status_label}</span></td>'
-            f'<td class="num" style="color:#1a7f37">+{add_c}</td>'
-            f'<td class="num" style="color:#cf222e">-{del_c}</td></tr>'
-        )
-
-    summary_rows.append(
-        f'          <tr style="font-weight:600;background:var(--header-bg)">'
-        f'<td>Total ({len(files)} files)</td><td></td>'
-        f'<td class="num" style="color:#1a7f37">+{total_add}</td>'
-        f'<td class="num" style="color:#cf222e">-{total_del}</td></tr>'
+    html_output, total_add, total_del = build_html(
+        entries, repo_name, commit_label, old_label, new_label,
+        syntax=not args.no_syntax, context=args.context,
     )
-
-    html_output = HTML_TEMPLATE.format(
-        title=repo_name, repo=repo_name, commit_label=commit_label,
-        gen_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        file_count=len(files),
-        sidebar_items="\n".join(sidebar_items),
-        summary_rows="\n".join(summary_rows),
-        file_sections="\n".join(file_sections),
-    )
-
-    if args.output:
-        out_path = os.path.abspath(args.output)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(html_output)
-    else:
-        # Produce the report in the system temp dir (TMPDIR or /tmp) under a
-        # secure, randomly-generated name via mkstemp, then keep the file open
-        # for writing through the same descriptor (avoids chmod/rename races).
-        fd, out_path = tempfile.mkstemp(prefix="git_diff_", suffix=".html")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(html_output)
-
-    print(f"\nDiff report generated: {out_path}")
-    print(f"  Files: {len(files)}  (+{total_add} / -{total_del} lines)")
-
-    if not args.no_open:
-        import webbrowser
-        webbrowser.open(f"file://{out_path}")
-        print(f"  Opened in default browser: file://{out_path}")
-    else:
-        print(f"  Open in browser: file://{out_path}")
+    _finish(html_output, len(files), total_add, total_del, args)
 
 
 if __name__ == "__main__":
